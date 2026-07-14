@@ -1,0 +1,47 @@
+#### Semantic-Acoustic Conv-TasNet example (paths must be adapted locally)
+name: Conv_TasNet_Semantic
+gpu_ids: [0]
+epochs: 100
+
+datasets:
+  num_workers: 4
+  batch_size: 4
+  fs: 16000
+  # Use full utterances for the first experiment. Cached LLM semantics describe
+  # the complete utterance and should not leak outside a random audio chunk.
+  train:
+    semantic_root: /home/zt/Desktop/STL/Multi-talker-ASR-with-LLMs/semantic_features/libri2mix_clean_offset/train
+  val:
+    semantic_root: /home/zt/Desktop/STL/Multi-talker-ASR-with-LLMs/semantic_features/libri2mix_clean_offset/dev
+
+train:
+  optimizer: adam
+  min_lr: !!float 1e-8
+  patience: 2
+  factor: 0.5
+  logging_period: 200
+  clip_norm: 5
+  num_epochs: 100
+  checkpoint: Conv-TasNet-Semantic-Negotiation
+
+optimizer_kwargs:
+  lr: !!float 1e-3
+  weight_decay: !!float 1e-5
+
+net_conf:
+  N: 512
+  L: 16
+  B: 128
+  H: 512
+  P: 3
+  X: 8
+  R: 3
+  norm: gln
+  num_spks: 2
+  activate: relu
+  causal: false
+  semantic_dim: 2048
+  semantic_heads: 4
+  front_repeats: 1
+  semantic_dropout: 0.0
+

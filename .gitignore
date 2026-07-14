@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+
+# Training outputs and checkpoints
+exp/
+*.pt
+*.pth
+*.ckpt
+
+# Local environments and editor metadata
+.venv/
+venv/
+.idea/
+.vscode/
+
+# TensorBoard and local logs
+runs/
+tensorboard/
+*.log
