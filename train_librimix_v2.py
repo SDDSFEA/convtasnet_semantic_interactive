@@ -444,6 +444,13 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument(
+        "--resume-lr", type=float,
+        help=(
+            "Override the checkpoint learning rate when resuming. By default, "
+            "resume preserves the optimizer and scheduler learning rate."
+        ),
+    )
+    parser.add_argument(
         "--lr-patience", type=int, default=3,
         help=(
             "Number of completed epochs without dev-loss improvement to "
@@ -520,6 +527,8 @@ def main(model_class=ConvTasNetSemanticV2, checkpoint_version=2,
         raise ValueError("lr-factor must be between 0 and 1")
     if args.min_lr < 0.0 or args.min_lr > args.lr:
         raise ValueError("min-lr must be non-negative and no greater than lr")
+    if args.resume_lr is not None and args.resume_lr <= 0.0:
+        raise ValueError("resume-lr must be positive")
     if (
         require_baseline_pretrained
         and not args.acoustic_pretrained_checkpoint
@@ -574,16 +583,15 @@ def main(model_class=ConvTasNetSemanticV2, checkpoint_version=2,
         checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
-        # Optimizer checkpoints include their original learning rates. Make the
-        # explicit command-line --lr authoritative when branching or reducing
-        # the learning rate for a resumed run.
-        restored_lrs = [group["lr"] for group in optimizer.param_groups]
-        for group in optimizer.param_groups:
-            group["lr"] = args.lr
-        LOG.info(
-            "resume optimizer learning rates overridden: %s -> %s",
-            restored_lrs, [group["lr"] for group in optimizer.param_groups],
-        )
+        if args.resume_lr is not None:
+            restored_lrs = [group["lr"] for group in optimizer.param_groups]
+            for group in optimizer.param_groups:
+                group["lr"] = args.resume_lr
+            LOG.info(
+                "resume optimizer learning rates overridden: %s -> %s",
+                restored_lrs,
+                [group["lr"] for group in optimizer.param_groups],
+            )
         start_epoch = checkpoint["epoch"] + (
             1 if checkpoint.get("epoch_complete", True) else 0
         )
