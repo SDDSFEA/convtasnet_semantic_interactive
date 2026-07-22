@@ -19,6 +19,7 @@ from torch.utils.data import DataLoader
 
 from Conv_TasNet_Semantic import ConvTasNetSemantic, masked_mean
 from Conv_TasNet_Semantic_V2 import ConvTasNetSemanticV2
+from Conv_TasNet_Semantic_V3 import ConvTasNetSemanticV3
 from SI_SNR import sisnr
 from train_librimix import (
     LibriMixFullUtterance,
@@ -56,7 +57,10 @@ def load_model(checkpoint_path, device):
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     saved_args_path = checkpoint_path.parent / "arguments.json"
     saved_args = json.loads(saved_args_path.read_text()) if saved_args_path.exists() else {}
-    model_class = ConvTasNetSemanticV2 if checkpoint.get("version") == 2 else ConvTasNetSemantic
+    model_class = {
+        2: ConvTasNetSemanticV2,
+        3: ConvTasNetSemanticV3,
+    }.get(checkpoint.get("version"), ConvTasNetSemantic)
     model = model_class(
         N=saved_args.get("N", 512),
         L=saved_args.get("L", 16),

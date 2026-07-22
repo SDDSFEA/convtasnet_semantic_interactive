@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 
 class GlobalLayerNorm(nn.Module):
@@ -187,8 +188,10 @@ class ConvTasNet(nn.Module):
                  norm="gln",
                  num_spks=2,
                  activate="relu",
-                 causal=False):
+                 causal=False,
+                 gradient_checkpointing=False):
         super(ConvTasNet, self).__init__()
+        self.gradient_checkpointing = gradient_checkpointing
         # n x 1 x T => n x N x T
         self.encoder = Conv1D(1, N, L, stride=L // 2, padding=0)
         # n x N x T  Layer Normalization of Separation
@@ -250,7 +253,18 @@ class ConvTasNet(nn.Module):
         e = self.LayerN_S(w)
         e = self.BottleN_S(e)
         # n x B x L => n x B x L
-        e = self.separation(e)
+        if (
+                self.gradient_checkpointing
+                and self.training
+                and torch.is_grad_enabled()
+                and len(self.separation) > 0):
+            # Checkpoint one TCN repeat per segment. This preserves parameter
+            # names/checkpoint compatibility while avoiding storage of all
+            # intermediate block activations for full-utterance training.
+            for repeat in self.separation:
+                e = checkpoint(repeat, e, use_reentrant=False)
+        else:
+            e = self.separation(e)
         # n x B x L => n x num_spk*N x L
         m = self.gen_masks(e)
         # n x N x L x num_spks

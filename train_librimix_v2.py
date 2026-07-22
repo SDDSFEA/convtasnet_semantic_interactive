@@ -12,6 +12,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
@@ -29,7 +30,7 @@ from train_librimix import (
 LOG = logging.getLogger("train_librimix_v2")
 
 
-def load_acoustic_pretrained(model, checkpoint_path):
+def load_acoustic_pretrained(model, checkpoint_path, require_baseline=False):
     """Load every non-negotiation tensor and keep V2 negotiation fresh.
 
     This is initialization, not resume: optimizer state, epoch, global step,
@@ -49,8 +50,89 @@ def load_acoustic_pretrained(model, checkpoint_path):
             "Acoustic pretrained checkpoint must be a state_dict or contain "
             "a 'model' state_dict"
         )
+    if require_baseline and any(
+        key.startswith("negotiation.") for key in source_state
+    ):
+        raise ValueError(
+            "V3 initialization requires a baseline checkpoint without "
+            "negotiation.* tensors; a semantic checkpoint was provided"
+        )
 
     target_state = model.state_dict()
+    if require_baseline:
+        mapped_state = {}
+        fresh_keys = []
+        derived_keys = []
+        front_repeats = len(model.front_tcn)
+        for target_key, target_value in target_state.items():
+            if target_key.startswith("negotiation."):
+                fresh_keys.append(target_key)
+                continue
+            source_key = target_key
+            if target_key.startswith("front_tcn."):
+                source_key = "separation." + target_key[len("front_tcn."):]
+            elif target_key.startswith("back_tcn."):
+                suffix = target_key[len("back_tcn."):]
+                repeat, remainder = suffix.split(".", 1)
+                source_key = f"separation.{int(repeat) + front_repeats}.{remainder}"
+            elif target_key.startswith("rough_mask_head."):
+                source_key = "gen_masks." + target_key.split(".", 1)[1]
+            elif target_key.startswith("final_mask_head."):
+                baseline_key = "gen_masks." + target_key.split(".", 1)[1]
+                if baseline_key not in source_state:
+                    raise RuntimeError(
+                        f"Baseline checkpoint is missing {baseline_key}"
+                    )
+                baseline_value = source_state[baseline_key]
+                if baseline_value.shape[0] != 2 * target_value.shape[0]:
+                    raise RuntimeError(
+                        f"Cannot derive {target_key} from {baseline_key}: "
+                        f"{tuple(target_value.shape)} vs "
+                        f"{tuple(baseline_value.shape)}"
+                    )
+                mapped_state[target_key] = baseline_value.reshape(
+                    2, target_value.shape[0], *target_value.shape[1:]
+                ).mean(dim=0)
+                derived_keys.append(target_key)
+                continue
+            elif target_key.startswith("source_projection."):
+                fresh_keys.append(target_key)
+                continue
+
+            if source_key not in source_state:
+                raise RuntimeError(
+                    f"Baseline checkpoint is missing {source_key} needed for "
+                    f"{target_key}"
+                )
+            if source_state[source_key].shape != target_value.shape:
+                raise RuntimeError(
+                    f"Baseline shape mismatch for {target_key} <- {source_key}: "
+                    f"{tuple(target_value.shape)} vs "
+                    f"{tuple(source_state[source_key].shape)}"
+                )
+            mapped_state[target_key] = source_state[source_key]
+
+        incompatible = model.load_state_dict(mapped_state, strict=False)
+        if incompatible.unexpected_keys or set(incompatible.missing_keys) != set(fresh_keys):
+            raise RuntimeError(
+                "Unexpected baseline mapping result: "
+                f"unexpected={list(incompatible.unexpected_keys)}, "
+                f"missing={list(incompatible.missing_keys)}"
+            )
+        LOG.info(
+            "initialized V3 from baseline %s: exact=%d derived=%d fresh=%d",
+            checkpoint_path, len(mapped_state) - len(derived_keys),
+            len(derived_keys), len(fresh_keys),
+        )
+        return {
+            "path": str(Path(checkpoint_path).resolve()),
+            "source_model": "baseline",
+            "exact_mapped_tensors": len(mapped_state) - len(derived_keys),
+            "derived_mask_tensors": len(derived_keys),
+            "fresh_tensors": len(fresh_keys),
+            "fresh_tensor_prefixes": ["source_projection.", "negotiation."],
+        }
+
     acoustic_keys = [
         key for key in target_state if not key.startswith("negotiation.")
     ]
@@ -361,6 +443,21 @@ def parse_args():
     )
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument(
+        "--lr-patience", type=int, default=3,
+        help=(
+            "Number of completed epochs without dev-loss improvement to "
+            "tolerate before reducing LR."
+        ),
+    )
+    parser.add_argument(
+        "--lr-factor", type=float, default=0.5,
+        help="Multiplier applied when the validation loss plateaus.",
+    )
+    parser.add_argument(
+        "--min-lr", type=float, default=1e-6,
+        help="Lower bound for the automatically reduced learning rate.",
+    )
     parser.add_argument("--weight-decay", type=float, default=1e-5)
     parser.add_argument("--lambda-match", type=float, default=0.02)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
@@ -407,7 +504,8 @@ def parse_args():
     return parser.parse_args()
 
 
-def main():
+def main(model_class=ConvTasNetSemanticV2, checkpoint_version=2,
+         require_baseline_pretrained=False):
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     if args.gradient_accumulation_steps < 1:
@@ -416,14 +514,31 @@ def main():
         raise ValueError("lambda-match must be non-negative")
     if args.val_interval_steps < 0:
         raise ValueError("val-interval-steps must be non-negative")
+    if args.lr_patience < 0:
+        raise ValueError("lr-patience must be non-negative")
+    if not 0.0 < args.lr_factor < 1.0:
+        raise ValueError("lr-factor must be between 0 and 1")
+    if args.min_lr < 0.0 or args.min_lr > args.lr:
+        raise ValueError("min-lr must be non-negative and no greater than lr")
+    if (
+        require_baseline_pretrained
+        and not args.acoustic_pretrained_checkpoint
+        and not args.resume
+    ):
+        raise ValueError(
+            "V3 training requires --acoustic-pretrained-checkpoint pointing "
+            "to a trained baseline checkpoint"
+        )
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but unavailable")
 
     device = torch.device(args.device)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    run_arguments = vars(args).copy()
+    run_arguments.update(model="semantic", version=checkpoint_version)
     (output_dir / "arguments.json").write_text(
-        json.dumps(vars(args), indent=2), encoding="utf-8"
+        json.dumps(run_arguments, indent=2), encoding="utf-8"
     )
     writer = SummaryWriter(log_dir=str(output_dir / "tensorboard"))
 
@@ -442,14 +557,15 @@ def main():
         collate_fn=collate_one,
     )
 
-    model = ConvTasNetSemanticV2(
+    model = model_class(
         N=args.N, L=args.L, B=args.B, H=args.H, P=args.P, X=args.X, R=args.R,
         num_spks=2, gradient_checkpointing=args.gradient_checkpointing,
     )
     initialization_info = None
     if args.acoustic_pretrained_checkpoint:
         initialization_info = load_acoustic_pretrained(
-            model, args.acoustic_pretrained_checkpoint
+            model, args.acoustic_pretrained_checkpoint,
+            require_baseline=require_baseline_pretrained,
         )
     model.to(device)
     optimizer = make_optimizer(model, args.lr, args.weight_decay)
@@ -458,12 +574,32 @@ def main():
         checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
+        # Optimizer checkpoints include their original learning rates. Make the
+        # explicit command-line --lr authoritative when branching or reducing
+        # the learning rate for a resumed run.
+        restored_lrs = [group["lr"] for group in optimizer.param_groups]
+        for group in optimizer.param_groups:
+            group["lr"] = args.lr
+        LOG.info(
+            "resume optimizer learning rates overridden: %s -> %s",
+            restored_lrs, [group["lr"] for group in optimizer.param_groups],
+        )
         start_epoch = checkpoint["epoch"] + (
             1 if checkpoint.get("epoch_complete", True) else 0
         )
         global_step = checkpoint.get("global_step", 0)
         best_dev = checkpoint.get("best_dev", best_dev)
         initialization_info = checkpoint.get("initialization")
+
+    scheduler = ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=args.lr_factor,
+        patience=args.lr_patience,
+        min_lr=args.min_lr,
+    )
+    if args.resume and checkpoint.get("scheduler") is not None:
+        scheduler.load_state_dict(checkpoint["scheduler"])
 
     LOG.info(
         "params=%.2fM train=%d dev=%d lambda_match=%g semantic_weight_decay=0 "
@@ -495,16 +631,32 @@ def main():
                             value,
                             current_global_step,
                         )
+                old_lrs = [group["lr"] for group in optimizer.param_groups]
+                if epoch_complete:
+                    scheduler.step(dev_metrics["loss"])
+                new_lrs = [group["lr"] for group in optimizer.param_groups]
+                for group_index, lr in enumerate(new_lrs):
+                    writer.add_scalar(
+                        f"optimizer/learning_rate_group_{group_index}",
+                        lr,
+                        current_global_step,
+                    )
+                if new_lrs != old_lrs:
+                    LOG.info(
+                        "automatic learning-rate reduction: %s -> %s",
+                        old_lrs, new_lrs,
+                    )
                 writer.flush()
 
                 state = {
-                    "version": 2,
+                    "version": checkpoint_version,
                     "epoch": epoch,
                     "epoch_complete": epoch_complete,
                     "global_step": current_global_step,
                     "best_dev": min(best_dev, dev_metrics["loss"]),
                     "model": model.state_dict(),
                     "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
                     "train_metrics": train_metrics,
                     "dev_metrics": dev_metrics,
                     "initialization": initialization_info,

@@ -280,7 +280,9 @@ def main():
 
     common = dict(N=args.N, L=args.L, B=args.B, H=args.H, P=args.P, X=args.X, R=args.R, num_spks=2)
     model = (
-        ConvTasNet(**common)
+        ConvTasNet(
+            **common, gradient_checkpointing=args.gradient_checkpointing
+        )
         if args.model == "baseline"
         else ConvTasNetSemantic(
             **common, gradient_checkpointing=args.gradient_checkpointing

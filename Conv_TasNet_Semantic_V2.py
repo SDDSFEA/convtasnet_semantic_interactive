@@ -50,6 +50,18 @@ class SemanticAcousticNegotiationV2(nn.Module):
         nn.init.constant_(self.local_gate.bias, gate_bias)
         self.register_buffer("alpha", torch.ones(()), persistent=True)
 
+    def build_local_input(self, acoustic, proposal_channels):
+        """Construct the V2 four-way comparison used by the local gate."""
+        return torch.cat(
+            [
+                acoustic,
+                proposal_channels,
+                acoustic * proposal_channels,
+                (acoustic - proposal_channels).abs(),
+            ],
+            dim=2,
+        )
+
     def forward(
         self,
         acoustic: torch.Tensor,
@@ -125,15 +137,7 @@ class SemanticAcousticNegotiationV2(nn.Module):
 
         proposal = self.proposal_norm(torch.stack(proposals, dim=1))
         proposal_channels = proposal.permute(0, 1, 3, 2)
-        local_input = torch.cat(
-            [
-                acoustic,
-                proposal_channels,
-                acoustic * proposal_channels,
-                (acoustic - proposal_channels).abs(),
-            ],
-            dim=2,
-        )
+        local_input = self.build_local_input(acoustic, proposal_channels)
         local_gate = torch.stack(
             [
                 torch.sigmoid(self.local_gate(local_input[:, source_index]))
