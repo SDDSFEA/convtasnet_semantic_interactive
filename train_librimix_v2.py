@@ -451,7 +451,7 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--lr-patience", type=int, default=3,
+        "--lr-patience", type=int, default=6,
         help=(
             "Number of completed epochs without dev-loss improvement to "
             "tolerate before reducing LR."
@@ -462,7 +462,7 @@ def parse_args():
         help="Multiplier applied when the validation loss plateaus.",
     )
     parser.add_argument(
-        "--min-lr", type=float, default=1e-6,
+        "--min-lr", type=float, default=1e-7,
         help="Lower bound for the automatically reduced learning rate.",
     )
     parser.add_argument("--weight-decay", type=float, default=1e-5)
@@ -608,6 +608,13 @@ def main(model_class=ConvTasNetSemanticV2, checkpoint_version=2,
     )
     if args.resume and checkpoint.get("scheduler") is not None:
         scheduler.load_state_dict(checkpoint["scheduler"])
+        # Preserve plateau history while allowing the current run's scheduler
+        # configuration (including new defaults) to take effect.
+        scheduler.factor = args.lr_factor
+        scheduler.patience = args.lr_patience
+        scheduler.min_lrs = [
+            args.min_lr for _ in optimizer.param_groups
+        ]
 
     LOG.info(
         "params=%.2fM train=%d dev=%d lambda_match=%g semantic_weight_decay=0 "
